@@ -459,6 +459,7 @@ class ClusterTreeConfig(TreeBuilderConfig):
 
 class ClusterTreeBuilder(TreeBuilder):
     config:ClusterTreeConfig
+    _summary_cache = {}
 
     def construct_tree(
         self,
@@ -476,10 +477,12 @@ class ClusterTreeBuilder(TreeBuilder):
         ):
             node_texts = get_text(cluster)
 
-            summarized_text = self.summarize(
-                context=node_texts,
-                max_tokens=summarization_length,
-            )
+            child_ids = tuple(sorted(n.index for n in cluster))
+            if child_ids in self._summary_cache:
+                summarized_text = self._summary_cache[child_ids]
+            else:
+                summarized_text = self.summarize(context=node_texts, max_tokens=summarization_length)
+                self._summary_cache[child_ids] = summarized_text
 
             logging.info(
                 f"Node Texts Length: {self.config.token_len(node_texts)}, "
@@ -888,24 +891,137 @@ class RetrievalAugmentation:
             self.retriever = None
 
         logging.info("RetrievalAugmentation initialized with config %s", config)
-
-    def add_documents(self, docs):
+        
+    # --- helper: rebuild a full Tree object given a leaf-node dict ---
+    def _build_tree_from_leaf_nodes(self, leaf_nodes: Dict[int, Node],
+                                    use_multithreading=False) -> Tree:
         """
-        Adds documents to the tree and creates a TreeRetriever instance.
+        Rebuilds the complete tree (all layers) from a dict of leaf nodes.
+
+        NOTE: This uses the existing TreeBuilder.construct_tree() pipeline so that
+        clustering/summarization behavior stays identical to build_from_text().
+        """
+        # Layer 0 = leaves
+        layer_to_nodes = {0: list(leaf_nodes.values())}
+
+        # Start the all_nodes dict with the leaves; construct_tree will append parents
+        all_nodes = copy.deepcopy(leaf_nodes)
+
+        # Build upper layers
+        root_nodes = self.tree_builder.construct_tree(
+            current_level_nodes=leaf_nodes,
+            all_tree_nodes=all_nodes,
+            layer_to_nodes=layer_to_nodes,
+            use_multithreading=use_multithreading,  # keep default behavior consistent; change if you prefer
+        )
+
+        # Create a new Tree object
+        new_tree = Tree(
+            all_nodes=all_nodes,
+            root_nodes=root_nodes,
+            leaf_nodes=leaf_nodes,
+            num_layers=self.tree_builder.config.num_layers,
+            layer_to_nodes=layer_to_nodes,
+        )
+        return new_tree
+
+    def add_to_existing(
+        self,
+        docs,
+        *,
+        deduplicate: bool = True,
+        use_multithreading: bool = False,
+    ) -> None:
+        """
+        Incrementally add new documents to the existing tree.
+
+        Strategy: Merge old leaf nodes with the new docs' chunks, then rebuild the
+        upper layers with the current clustering/summarization pipeline. Existing
+        leaf embeddings are reused; new chunk embeddings are computed once.
 
         Args:
-            docs (str): The input text to add to the tree.
+            docs (str | List[str]): Text to add.
+            deduplicate (bool): If True, skip new chunks that are identical to
+                existing leaf texts (simple exact-string match).
+            use_multithreading (bool): Whether to parallelize summarization in
+                construct_tree. Defaults to False for reproducibility.
         """
-        if self.tree is not None:
-            user_input = input(
-                "Warning: Overwriting existing tree. Did you mean to call 'add_to_existing' instead? (y/n): "
-            )
-            if user_input.lower() == "y":
-                # self.add_to_existing(docs)
+        # If there is no tree yet, just build a new one
+        if self.tree is None:
+            self.add_documents(docs)
+            return
+
+        # Normalize docs input
+        if isinstance(docs, list):
+            docs = "\n\n".join([d for d in docs if isinstance(d, str) and d.strip()])
+        elif not isinstance(docs, str):
+            raise ValueError("docs must be a string or a list of strings")
+
+        docs = docs.strip()
+        if not docs:
+            logging.info("add_to_existing called with empty docs; nothing to add.")
+            return
+
+        # Prepare chunking with the same tokenizer/max_tokens as the builder
+        tokenizer = self.tree_builder.config.tokenizer()
+        max_tokens = self.tree_builder.config.max_tokens
+        chunks = split_text(docs, tokenizer=tokenizer, max_tokens=max_tokens)
+
+        if not chunks:
+            logging.info("No chunks produced from docs; nothing to add.")
+            return
+
+        # Copy existing leaf nodes (reusing their embeddings)
+        new_leaf_nodes: Dict[int, Node] = dict(self.tree.leaf_nodes)
+
+        # Optional de-duplication by exact text match against existing leaves
+        if deduplicate:
+            existing_texts: Set[str] = {
+                " ".join(n.text.splitlines()).strip() for n in new_leaf_nodes.values()
+            }
+            chunks = [c for c in chunks if c.strip() and c.strip() not in existing_texts]
+            if not chunks:
+                logging.info("All new chunks were duplicates of existing leaves.")
                 return
+
+        # Assign unique indices for the new chunks
+        start_index = (max(self.tree.all_nodes.keys()) + 1) if self.tree.all_nodes else 0
+
+        # Create nodes (this computes embeddings only for the new chunks)
+        for offset, text in enumerate(chunks):
+            node_index = start_index + offset
+            _, node = self.tree_builder.create_node(index=node_index, text=text)
+            new_leaf_nodes[node_index] = node
+
+        # Rebuild the whole tree (parents) from the combined leaves
+        # (Reuse the same construct_tree pipeline to keep behavior consistent)
+        # Optionally allow multithreading in the construct step
+        # (we pass the flag through by temporarily overriding the default parameter)
+        tree = self._build_tree_from_leaf_nodes(new_leaf_nodes,use_multithreading)
+
+        # Swap in the new tree and refresher retriever
+        self.tree = tree
+        self.retriever = TreeRetriever(self.tree_retriever_config, self.tree)
+
+        logging.info(
+            "add_to_existing: added %d new chunks; total leaf nodes: %d; total nodes: %d",
+            len(chunks),
+            len(self.tree.leaf_nodes),
+            len(self.tree.all_nodes),
+        )
+
+    def add_documents(self, docs):
+        if self.tree is not None:
+            logging.warning(
+                "Tree already exists; forwarding to add_to_existing(). "
+                "If you intended to overwrite, set self.tree=None first."
+            )
+            self.add_to_existing(docs)
+            return
 
         self.tree = self.tree_builder.build_from_text(text=docs)
         self.retriever = TreeRetriever(self.tree_retriever_config, self.tree)
+
 
     def retrieve(
         self,
